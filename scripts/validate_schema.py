@@ -35,6 +35,13 @@ def test_four_surfaces_and_roles(db):
     db.execute("INSERT INTO user_roles(user_id,role) VALUES ('u_host','user'),('u_host','host')")
     db.execute("INSERT INTO user_roles(user_id,role) VALUES ('u_customer','user')")
 
+    # Explicit validation: Admin + Host + User all assigned simultaneously to one registered account
+    db.execute("INSERT INTO users(id,email_normalized,display_name) VALUES ('u_omni','omni@example.test','Omni User')")
+    db.execute("INSERT INTO user_roles(user_id,role) VALUES ('u_omni','admin'),('u_omni','host'),('u_omni','user')")
+    assert db.execute("SELECT COUNT(*) FROM user_roles WHERE user_id='u_omni'").fetchone()[0] == 3
+    db.execute("INSERT INTO admin_profiles(user_id,title) VALUES ('u_omni','Platform Owner Admin')")
+    db.execute("INSERT INTO host_profiles(id,user_id,display_name) VALUES ('hp_omni','u_omni','Omni Host Operations')")
+
     # Associated profiles
     db.execute("INSERT INTO admin_profiles(user_id,title) VALUES ('u_admin','Super Admin')")
     db.execute("INSERT INTO host_profiles(id,user_id,display_name) VALUES ('hp_1','u_host','Premier Events Host')")
@@ -143,7 +150,13 @@ def test_atomic_reservations_and_limits(db):
 
 
 def test_media_lifecycle_and_idempotency(db):
-    """Test media item state transitions, client upload ID idempotency, and duration checks."""
+    """Test media item permitted status values, example progression, idempotency, and format checks.
+
+    Note: These schema tests validate permitted status enum values and an example
+    status progression ('reserved' -> 'uploading' -> 'uploaded' -> 'ready').
+    They do not test an exhaustive server-side transition state machine, which is
+    enforced by Worker API route handlers.
+    """
     # Valid reservation
     db.execute("""INSERT INTO media_items(id,event_id,guest_id,client_upload_id,media_kind,source_kind,status,reserved_bytes)
         VALUES ('m_10','e_combo','g_combo','client-up-10','photo','camera','reserved',5000000)""")
@@ -173,7 +186,54 @@ def test_media_lifecycle_and_idempotency(db):
     # Invalid status enum
     must_fail(lambda: db.execute("UPDATE media_items SET status='published' WHERE id='m_10'"), "invalid media_item status enum")
 
-    print("PASS media lifecycle, idempotency and format checks verified")
+    print("PASS media permitted status, example progression, idempotency and format checks verified")
+
+
+def test_orders_and_payments(db):
+    """Test orders and payments constraints, foreign keys, and status validation."""
+    # Create order linked to quote q_valid
+    db.execute("""INSERT INTO orders(id,quote_id,event_id,customer_user_id,created_by_user_id,status,payment_channel,total_paise)
+        VALUES ('o_100','q_valid','e_1','u_customer','u_admin','pending','manual',80000)""")
+
+    # Reject duplicate order for same quote (quote_id is UNIQUE on orders)
+    must_fail(lambda: db.execute("""INSERT INTO orders(id,quote_id,event_id,customer_user_id,created_by_user_id,status,payment_channel,total_paise)
+        VALUES ('o_101','q_valid','e_1','u_customer','u_admin','pending','manual',80000)"""), "duplicate order for same quote")
+
+    # Reject invalid order status enum
+    must_fail(lambda: db.execute("""INSERT INTO orders(id,quote_id,event_id,customer_user_id,created_by_user_id,status,payment_channel,total_paise)
+        VALUES ('o_bad_status','q_valid',NULL,NULL,'u_admin','settled','manual',80000)"""), "invalid order status enum")
+
+    # Reject invalid payment channel enum
+    must_fail(lambda: db.execute("""INSERT INTO orders(id,quote_id,event_id,customer_user_id,created_by_user_id,status,payment_channel,total_paise)
+        VALUES ('o_bad_chan','q_valid',NULL,NULL,'u_admin','pending','crypto',80000)"""), "invalid payment channel enum")
+
+    # Payments table tests: valid manual payment entry
+    db.execute("""INSERT INTO payments(id,order_id,method,status,amount_paise,payment_reference,verified_by_user_id)
+        VALUES ('p_100','o_100','upi_manual','pending',80000,'UPI12345678',NULL)""")
+
+    # Reject payment with amount_paise <= 0
+    must_fail(lambda: db.execute("""INSERT INTO payments(id,order_id,method,status,amount_paise)
+        VALUES ('p_zero','o_100','upi_manual','pending',0)"""), "zero payment amount")
+
+    # Reject invalid payment method
+    must_fail(lambda: db.execute("""INSERT INTO payments(id,order_id,method,status,amount_paise)
+        VALUES ('p_bad_method','o_100','bitcoin','pending',50000)"""), "invalid payment method enum")
+
+    # Reject invalid payment status
+    must_fail(lambda: db.execute("""INSERT INTO payments(id,order_id,method,status,amount_paise)
+        VALUES ('p_bad_status','o_100','cash','settled',50000)"""), "invalid payment status enum")
+
+    # Verify payment verification transition
+    db.execute("UPDATE payments SET status='verified', verified_by_user_id='u_admin', verified_at=unixepoch() WHERE id='p_100'")
+    db.execute("UPDATE orders SET status='paid', paid_at=unixepoch() WHERE id='o_100'")
+    assert db.execute("SELECT status FROM orders WHERE id='o_100'").fetchone() == ('paid',)
+    assert db.execute("SELECT status, verified_by_user_id FROM payments WHERE id='p_100'").fetchone() == ('verified', 'u_admin')
+
+    # Foreign key rejection for non-existent order
+    must_fail(lambda: db.execute("""INSERT INTO payments(id,order_id,method,status,amount_paise)
+        VALUES ('p_ghost','o_missing','cash','pending',1000)"""), "payment referencing non-existent order")
+
+    print("PASS orders and payments constraints, foreign keys, and status validation verified")
 
 
 def test_discount_codes_and_quotes(db):
@@ -207,6 +267,7 @@ def main():
     test_atomic_reservations_and_limits(db)
     test_media_lifecycle_and_idempotency(db)
     test_discount_codes_and_quotes(db)
+    test_orders_and_payments(db)
 
     # Ensure no lingering foreign key violations across all test steps
     fk_violations = db.execute("PRAGMA foreign_key_check").fetchall()

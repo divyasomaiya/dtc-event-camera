@@ -8,7 +8,7 @@
 ---
 
 ## 1. Repository and Git State
-- **Repository:** Private GitHub repository (`dtc-event-camera`)
+- **Repository:** GitHub repository (`dtc-event-camera`). *Note on visibility: GitHub currently reports the repository as public.*
 - **Base Commit:** `57cc7a592200085416b44cdba095eb2119664842`
 - **Jules Branch:** Dedicated Jules PR branch (`foundation-audit-and-tests`)
 - **Merge Status:** Awaiting owner review and PR merge before Antigravity development begins.
@@ -23,11 +23,12 @@
   - Verified clean execution and foreign key referential integrity with `PRAGMA foreign_key_check`.
 - **Test Suite Expansion (`scripts/validate_schema.py`):**
   - Expanded smoke test into a comprehensive constraint and conditional update validation suite.
-  - Added unit test cases for all 4 surfaces (Admin, Host, Guest, User) and role isolation.
+  - Added unit test cases for all 4 surfaces (Admin, Host, Guest, User) and role isolation, including explicit validation of simultaneous Admin + Host + User roles assigned to a single registered user account.
   - Added test cases for photo, video, and storage byte atomic reservation update guards.
   - Added test cases for guest capacity enrollment enforcement (`join_guest_sql`).
-  - Added test cases for media item lifecycle (`reserved -> uploading -> uploaded -> ready`), client upload ID idempotency, and MIME/duration constraints.
+  - Added test cases for media item permitted status values, example status progression (`reserved -> uploading -> uploaded -> ready`), client upload ID idempotency, and MIME/duration constraints. (Note: These validate permitted schema status values and sample progression, not an exhaustive server-side transition state machine).
   - Added test cases for discount codes (percentage basis points vs fixed amount) and quote total arithmetic integrity.
+  - Added test cases for orders and payments constraint validation (unique quote linkage, order status enums, payment channel enums, positive payment amounts, payment method and status enums, payment verification transitions, and FK integrity).
 - **Technical Audit Report (`docs/JULES_AUDIT_REPORT.md`):**
   - Documented complete architecture analysis, D1 vs SQLite concurrency differences, batch transaction patterns, R2 upload flows, and security guidelines.
 
@@ -64,12 +65,20 @@ PASS duplicate client_upload_id for same guest: constraint rejected invalid inpu
 PASS cross-event guest_id / event_id FK mismatch: constraint rejected invalid input
 PASS photo media_item with duration_ms: constraint rejected invalid input
 PASS invalid media_item status enum: constraint rejected invalid input
-PASS media lifecycle, idempotency and format checks verified
+PASS media permitted status, example progression, idempotency and format checks verified
 PASS percentage > 100%: constraint rejected invalid input
 PASS mixed discount kind fields: constraint rejected invalid input
 PASS fixed discount <= 0: constraint rejected invalid input
 PASS quote total_paise arithmetic mismatch: constraint rejected invalid input
 PASS discounts and quotes arithmetic checks verified
+PASS duplicate order for same quote: constraint rejected invalid input
+PASS invalid order status enum: constraint rejected invalid input
+PASS invalid payment channel enum: constraint rejected invalid input
+PASS zero payment amount: constraint rejected invalid input
+PASS invalid payment method enum: constraint rejected invalid input
+PASS invalid payment status enum: constraint rejected invalid input
+PASS payment referencing non-existent order: constraint rejected invalid input
+PASS orders and payments constraints, foreign keys, and status validation verified
 PASS final foreign key integrity check cleanly completed
 All SQLite smoke & constraint tests passed. Live Cloudflare D1 and concurrency tests remain required.
 ```
@@ -83,11 +92,14 @@ All SQLite smoke & constraint tests passed. Live Cloudflare D1 and concurrency t
    - **Host:** `users` with `user_roles.role = 'host'` + `host_profiles`. Organizes events, manages reveal and galleries.
    - **User:** `users` with `user_roles.role = 'user'`. Customer account for quotes and orders. Can be combined with host role.
    - **Guest:** `guests` table. Strictly anonymous, scoped to a single event. Identified solely by a server-minted session token hash in `guest_sessions`. No row in `users`.
-2. **Quota & Upload Atomicity:**
+2. **Quota & Upload Atomicity (Crucial D1 Nuance):**
    - Media quotas are reserved via conditional SQL updates:
      - Photos/Videos: Checked against `COALESCE(g.photo_limit_override, e.photo_limit_per_guest)` in `guest_usage`.
      - Storage Bytes: Checked against `events.storage_quota_bytes` in `event_usage`.
-   - In Cloudflare D1, these must be executed atomically using `env.DB.batch([...])`.
+   - In Cloudflare D1, a conditional `UPDATE` affecting zero rows does **NOT** throw an error or cause a batch to roll back automatically.
+   - **Safe Reservation Pattern:** Antigravity must implement one of two strategies:
+     a) *Application-level check:* Inspect the returned row count or result objects for every statement in `env.DB.batch(...)` and reject the reservation if 0 rows were updated.
+     b) *Database-level rejection:* Utilize SQLite triggers (`BEFORE INSERT/UPDATE ... RAISE(ABORT, ...)`) or conditional `INSERT` operations that trigger constraint violations on quota exhaustion, thereby forcing D1 batch rollback at the database level.
 3. **Private Media Handling:**
    - D1 stores metadata, sizes, and object keys only.
    - R2 stores actual binary objects and remains completely private. Access is mediated via short-lived signed URLs or authenticated Worker streaming endpoints.

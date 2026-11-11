@@ -71,10 +71,13 @@ The product requirements define four distinct surfaces:
 
 While the local test runner uses Python's standard `sqlite3` engine in-memory, Cloudflare D1 introduces specific runtime nuances:
 
-1. **Transactional Execution:**
+1. **Transactional Execution & Safe Atomic Quota Strategy:**
    - D1 does not support long-lived interactive transactions (`BEGIN TRANSACTION ... interactive queries ... COMMIT`) over HTTP/Worker calls.
-   - Atomic multi-statement transactions in D1 must be executed using the batch API: `env.DB.batch([stmt1, stmt2, stmt3])`.
-   - The batch execution runs within an atomic transaction inside D1. If any conditional update affects 0 rows, the Worker API logic must inspect the returning count or result rows and fail the batch appropriately.
+   - Multi-statement operations in D1 use the batch API: `env.DB.batch([stmt1, stmt2, stmt3])`.
+   - **Crucial D1 Behavior:** In SQLite/D1, a conditional `UPDATE ... WHERE ...` statement that affects **zero rows** is still syntactically valid and executes successfully without error. Therefore, a batch containing an `UPDATE` matching zero rows **will NOT automatically throw an error or roll back the transaction!**
+   - **Required Safe Reservation Strategies:**
+     1. *Inspection Strategy:* If using multi-statement batching with `RETURNING`, the Worker API application logic must explicitly inspect the returned rows / changes for each statement in the batch result array. If any conditional quota update returned 0 rows, the API must reject the request and perform a rollback or compensating reversal.
+     2. *Database-Level Rejection Strategy (Preferred):* Enforce rejection inside the database engine itself using triggers (e.g., `BEFORE INSERT/UPDATE` raising an `ABORT` or `RAISE(ABORT, 'Quota exceeded')` when limits are exceeded) or conditional `INSERT ... SELECT` statements with check constraints. When an engine-level abort/error occurs, D1 fails and rolls back the batch automatically.
 2. **Read Replication & Eventual Consistency:**
    - D1 supports read replication. Mutations run on the primary database, but subsequent reads directed to replicas might lag unless sessions/bookmarks are maintained. For quota checks, read-your-own-writes consistency is mandatory.
 3. **Database Size Limit:**
